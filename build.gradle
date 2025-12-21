@@ -4,7 +4,7 @@ plugins {
 }
 
 group = 'org.asgard'
-version = '0.1.0'
+version = '0.2.0'
 
 java {
     toolchain {
@@ -36,6 +36,11 @@ application {
 tasks.withType(JavaCompile).configureEach {
     options.encoding = 'UTF-8'
     options.release.set(17)
+}
+
+tasks.named("run", JavaExec) {
+    standardInput = System.in
+    maxHeapSize = '8g'
 }
 
 tasks.test {

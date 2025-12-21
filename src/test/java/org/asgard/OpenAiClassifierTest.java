@@ -125,4 +125,34 @@ class OpenAiClassifierTest {
         assertThat(result.name()).isEqualTo("MIT-GATEWAYS");
         assertThat(result.organization()).isEqualTo("Massachusetts Institute of Technology");
     }
+
+    @Test
+    void extractsCategoryFromClassificationLabelEvenWithVpnInReasoning() throws Exception {
+        // Model returned "Classification: Infrastructure" but reasoning mentioned VPN
+        final var responseJson = """
+                {
+                  "choices": [
+                    {
+                      "finish_reason": "stop",
+                      "message": {
+                        "content": "Classification: Infrastructure\\n\\nReasoning: The ASN 2, named UDEL-DCN (UNIVER-19-Z) appears to be an early, large-scale network identifier likely used by a major network infrastructure entity. It aligns with Infrastructure category (large carriers, Tier-1s, IXPs, route-servers) rather than end-user VPN/hosting/ISP/enterprise."
+                      }
+                    }
+                  ]
+                }
+                """;
+        server.enqueue(new MockResponse()
+                .setResponseCode(200)
+                .addHeader("Content-Type", "application/json")
+                .setBody(responseJson));
+
+        final var classifier = new OpenAiClassifier(HttpClient.newHttpClient(), new ObjectMapper(),
+                server.url("/v1/").uri(), "gpt-5-nano", "test-key", Duration.ofSeconds(5));
+        final var metadata = AsnMetadata.minimal(2, "UDEL-DCN", "US", "UNIVER-19-Z", "assigned");
+
+        final var result = classifier.classify(metadata);
+
+        // Should extract "Infrastructure" from "Classification: Infrastructure", NOT "VPN" from reasoning
+        assertThat(result.category()).isEqualTo("Infrastructure");
+    }
 }

@@ -26,6 +26,18 @@ public final class StatePaths {
         return cacheDir().resolve("allocations");
     }
 
+    public Path registryCacheDir() {
+        return cacheDir().resolve("registry");
+    }
+
+    public Path registryDatabaseFile() {
+        return registryCacheDir().resolve("registry-cache.ndjson");
+    }
+
+    public Path logsDir() {
+        return baseDir.resolve("logs");
+    }
+
     public Path outputFile(Path override) {
         return override != null ? override : baseDir.resolve("asn-classifications.tsv");
     }
@@ -35,6 +47,8 @@ public final class StatePaths {
             Files.createDirectories(baseDir);
             Files.createDirectories(cacheDir());
             Files.createDirectories(allocationsDir());
+            Files.createDirectories(registryCacheDir());
+            Files.createDirectories(logsDir());
         } catch (Exception ex) {
             throw new IllegalStateException("Unable to initialize state directories under " + baseDir, ex);
         }

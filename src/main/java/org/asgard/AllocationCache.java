@@ -6,7 +6,6 @@ import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
-import java.time.Duration;
 import java.time.Instant;
 import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
@@ -25,14 +24,19 @@ public final class AllocationCache {
         this.allocationsDir = allocationsDir;
     }
 
-    public List<AsnAllocation> loadAllocations(Config config) throws IOException, InterruptedException {
+    public List<AsnAllocation> loadAllocations(boolean refresh) throws IOException, InterruptedException {
         Files.createDirectories(allocationsDir);
-        var latest = newestFile();
-        if (latest.isPresent() && !isStale(latest.get(), config.registryTtl())) {
+        final var latest = newestFile();
+        if (latest.isPresent() && !refresh) {
             return readAllocations(latest.get());
         }
-        var allocations = registryClient.fetchAllocations();
-        var file = writeAllocations(allocations);
+        if (latest.isEmpty()) {
+            System.out.println("No cached allocations found, downloading fresh copy.");
+        } else if (refresh) {
+            System.out.println("Allocation refresh requested, downloading new data.");
+        }
+        final var allocations = registryClient.fetchAllocations();
+        final var file = writeAllocations(allocations);
         System.out.println("Wrote allocation cache " + file);
         return allocations;
     }
@@ -44,17 +48,12 @@ public final class AllocationCache {
         }
     }
 
-    private boolean isStale(Path file, Duration ttl) throws IOException {
-        var age = Duration.between(Files.getLastModifiedTime(file).toInstant(), Instant.now());
-        return age.compareTo(ttl) > 0;
-    }
-
     private List<AsnAllocation> readAllocations(Path file) throws IOException {
-        var allocations = new ArrayList<AsnAllocation>();
+        final var allocations = new ArrayList<AsnAllocation>();
         try (var reader = Files.newBufferedReader(file, StandardCharsets.UTF_8)) {
             String line;
             while ((line = reader.readLine()) != null) {
-                var node = mapper.readTree(line);
+                final var node = mapper.readTree(line);
                 allocations.add(mapper.treeToValue(node, AsnAllocation.class));
             }
         }
@@ -63,10 +62,10 @@ public final class AllocationCache {
     }
 
     private Path writeAllocations(List<AsnAllocation> allocations) throws IOException {
-        var filename = "allocations-" + DateTimeFormatter.ofPattern("yyyyMMdd'T'HHmmss'Z'")
+        final var filename = "allocations-" + DateTimeFormatter.ofPattern("yyyyMMdd'T'HHmmss'Z'")
                 .withZone(java.time.ZoneOffset.UTC)
                 .format(Instant.now()) + ".ndjson";
-        var file = allocationsDir.resolve(filename);
+        final var file = allocationsDir.resolve(filename);
         try (var writer = Files.newBufferedWriter(file, StandardCharsets.UTF_8)) {
             for (var allocation : allocations) {
                 writer.write(mapper.writeValueAsString(allocation));

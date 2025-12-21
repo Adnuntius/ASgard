@@ -9,8 +9,10 @@ import java.util.List;
 import java.util.Map;
 
 public record CliOptions(List<URI> registrySources, URI rdapBaseUri, URI openAiBaseUri, String openAiModel,
-                         String apiKey, long limit, Path outputFile, Duration rdapTimeout,
-                         Duration openAiTimeout, Path stateDir, List<Long> reprocessAsns) {
+                         String apiKey, String arinApiKey,
+                         boolean acceptUnknowns, long limit, Path outputFile, Duration rdapTimeout,
+                         Duration openAiTimeout, Path stateDir, List<Long> reprocessAsns,
+                         boolean refreshAllocations, boolean refreshRegistryDatabase, boolean skipArinBulk) {
 
     public static CliOptions parse(String[] args) {
         final var parsed = parseArgs(args);
@@ -21,6 +23,10 @@ public record CliOptions(List<URI> registrySources, URI rdapBaseUri, URI openAiB
                 "https://api.openai.com/v1/")));
         final var model = parsed.getOrDefault("model", "gpt-5-nano");
         final var apiKey = parsed.getOrDefault("api-key", System.getenv("OPENAI_API_KEY"));
+        final var arinApiKey = firstNonBlank(parsed.get("arin-api-key"),
+                System.getenv("ASGARD_ARIN_API_KEY"),
+                System.getenv("ARIN_API_KEY"));
+        final var acceptUnknowns = parseBoolean(parsed, "accept-unknowns");
         final var limit = parseLong(parsed.get("limit"), 50);
         final var output = parsed.containsKey("output") ? Path.of(parsed.get("output")) : null;
         final var rdapTimeout = Duration.ofSeconds(parseLong(parsed.get("rdap-timeout-seconds"), 10));
@@ -29,8 +35,11 @@ public record CliOptions(List<URI> registrySources, URI rdapBaseUri, URI openAiB
                 System.getenv().getOrDefault("ASGARD_STATE_DIR",
                         System.getProperty("user.home") + "/.asgard")));
         final var reprocessAsns = parseAsnList(parsed.get("reprocess"));
-        return new CliOptions(registry, rdapBase, openAiBase, model, apiKey, limit, output, rdapTimeout,
-                openAiTimeout, stateDir, reprocessAsns);
+        return new CliOptions(registry, rdapBase, openAiBase, model, apiKey, arinApiKey,
+                acceptUnknowns, limit, output, rdapTimeout,
+                openAiTimeout, stateDir, reprocessAsns, parseBoolean(parsed, "refresh-allocations"),
+                parseBoolean(parsed, "refresh-registry-db") || parseBoolean(parsed, "refresh-rdap-db"),
+                parseBoolean(parsed, "skip-arin-bulk"));
     }
 
     private static Map<String, String> parseArgs(String[] args) {
@@ -40,7 +49,11 @@ public record CliOptions(List<URI> registrySources, URI rdapBaseUri, URI openAiB
                 .map(arg -> arg.substring(2))
                 .forEach(token -> {
                     final var parts = token.split("=", 2);
-                    if (parts.length == 2) values.put(parts[0], parts[1]);
+                    if (parts.length == 2) {
+                        values.put(parts[0], parts[1]);
+                    } else if (!parts[0].isBlank()) {
+                        values.put(parts[0], "true");
+                    }
                 });
         return values;
     }
@@ -53,6 +66,12 @@ public record CliOptions(List<URI> registrySources, URI rdapBaseUri, URI openAiB
             result.add(URI.create(token.trim()));
         }
         return result;
+    }
+
+    private static boolean parseBoolean(Map<String, String> values, String key) {
+        final var raw = values.get(key);
+        if (raw == null) return false;
+        return raw.isBlank() || raw.equalsIgnoreCase("true") || raw.equalsIgnoreCase("yes") || raw.equals("1");
     }
 
     private static long parseLong(String candidate, long fallback) {
@@ -77,5 +96,13 @@ public record CliOptions(List<URI> registrySources, URI rdapBaseUri, URI openAiB
             }
         }
         return List.copyOf(result);
+    }
+
+    private static String firstNonBlank(String... values) {
+        if (values == null) return null;
+        for (final var value : values) {
+            if (value != null && !value.isBlank()) return value.trim();
+        }
+        return null;
     }
 }

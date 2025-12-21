@@ -4,7 +4,6 @@ import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
-import java.time.Duration;
 import java.util.HashMap;
 import java.util.Map;
 
@@ -24,8 +23,10 @@ public final class ConfigManager {
         try {
             final var values = parse(Files.readAllLines(configFile, StandardCharsets.UTF_8));
             final var model = values.getOrDefault("model", Config.defaultConfig().model());
-            final var ttlHours = parseLong(values.get("registryTtlHours"), Config.defaultConfig().registryTtl().toHours());
-            return new Config(model, Duration.ofHours(ttlHours));
+            final var arinApiKey = values.get("arinApiKey");
+            final var config = new Config(model, arinApiKey);
+            write(config);
+            return config;
         } catch (IOException ex) {
             final var config = Config.defaultConfig();
             write(config);
@@ -33,33 +34,34 @@ public final class ConfigManager {
         }
     }
 
+    public void save(Config config) {
+        write(config);
+    }
+
     private Map<String, String> parse(Iterable<String> lines) {
         final var map = new HashMap<String, String>();
         for (final var line : lines) {
-            if (line == null) continue;
+            if (line == null) {
+                continue;
+            }
             final var trimmed = line.trim();
-            if (trimmed.isEmpty() || trimmed.startsWith("#")) continue;
+            if (trimmed.isEmpty() || trimmed.startsWith("#")) {
+                continue;
+            }
             final var parts = trimmed.split("=", 2);
-            if (parts.length == 2) map.put(parts[0].trim(), parts[1].trim());
+            if (parts.length == 2) {
+                map.put(parts[0].trim(), parts[1].trim());
+            }
         }
         return map;
     }
 
-    private long parseLong(String value, long fallback) {
-        if (value == null || value.isBlank()) return fallback;
-        try {
-            return Long.parseLong(value);
-        } catch (NumberFormatException ex) {
-            return fallback;
-        }
-    }
-
     private void write(Config config) {
-        var content = """
+        final var content = """
                 # asgard.conf
                 model=%s
-                registryTtlHours=%d
-                """.formatted(config.model(), config.registryTtl().toHours());
+                arinApiKey=%s
+                """.formatted(config.model(), config.arinApiKey() == null ? "" : config.arinApiKey());
         try {
             Files.writeString(configFile, content, StandardCharsets.UTF_8,
                     java.nio.file.StandardOpenOption.CREATE, java.nio.file.StandardOpenOption.TRUNCATE_EXISTING);

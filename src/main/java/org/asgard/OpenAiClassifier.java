@@ -21,17 +21,23 @@ public final class OpenAiClassifier {
     private final String apiKey;
     private final Duration timeout;
     private final boolean verbose;
+    private final OpenAiRequestLogger requestLogger;
 
     public record ClassificationResponse(FinalClassification classification, long approximatePromptTokens, String rawResponseBody) {
     }
 
     public OpenAiClassifier(HttpClient httpClient, ObjectMapper objectMapper, URI baseUri, String model,
                             String apiKey, Duration timeout) {
-        this(httpClient, objectMapper, baseUri, model, apiKey, timeout, false);
+        this(httpClient, objectMapper, baseUri, model, apiKey, timeout, false, null);
     }
 
     public OpenAiClassifier(HttpClient httpClient, ObjectMapper objectMapper, URI baseUri, String model,
                             String apiKey, Duration timeout, boolean verbose) {
+        this(httpClient, objectMapper, baseUri, model, apiKey, timeout, verbose, null);
+    }
+
+    public OpenAiClassifier(HttpClient httpClient, ObjectMapper objectMapper, URI baseUri, String model,
+                            String apiKey, Duration timeout, boolean verbose, OpenAiRequestLogger requestLogger) {
         this.httpClient = httpClient;
         this.objectMapper = objectMapper;
         this.baseUri = baseUri.toString().endsWith("/") ? baseUri : URI.create(baseUri + "/");
@@ -39,6 +45,7 @@ public final class OpenAiClassifier {
         this.apiKey = apiKey;
         this.timeout = timeout;
         this.verbose = verbose;
+        this.requestLogger = requestLogger;
     }
 
     public ClassificationResponse classifyWithUsage(AsnMetadata metadata) throws IOException, InterruptedException {
@@ -48,6 +55,9 @@ public final class OpenAiClassifier {
         if (verbose) {
             System.out.println("\n=== OpenAI Request for AS" + metadata.asn() + " ===");
             System.out.println(requestBody);
+        }
+        if (requestLogger != null) {
+            requestLogger.logRequest(metadata, summary, requestBody);
         }
         final var request = HttpRequest.newBuilder(baseUri.resolve("chat/completions"))
                 .timeout(timeout)
@@ -63,6 +73,9 @@ public final class OpenAiClassifier {
             System.out.println(responseBody);
         }
         if (response.statusCode() >= 300) {
+            if (requestLogger != null) {
+                requestLogger.logResponse(metadata, response.statusCode(), responseBody, null, approxTokens);
+            }
             throw new IOException("OpenAI classification failed: " + response.statusCode() + " " + responseBody);
         }
         final var classification = parseResponse(metadata, responseBody);
@@ -70,6 +83,9 @@ public final class OpenAiClassifier {
             System.out.printf("\n=== Parsed Classification for AS%d ===%n", metadata.asn());
             System.out.printf("Name: %s%nOrganization: %s%nCategory: %s%n",
                     classification.name(), classification.organization(), classification.category());
+        }
+        if (requestLogger != null) {
+            requestLogger.logResponse(metadata, response.statusCode(), responseBody, classification, approxTokens);
         }
         return new ClassificationResponse(classification, approxTokens, responseBody);
     }
@@ -156,9 +172,9 @@ public final class OpenAiClassifier {
             if (Taxonomy.categories().contains(extracted)) return extracted;
         } catch (Exception ignored) {
         }
-        // Extract category from common patterns like "Category: X" or "- Category: X"
+        // Extract category from common patterns like "Category: X", "Classification: X", or "- Category: X"
         final var categoryPattern = java.util.regex.Pattern.compile(
-                "(?:^|\\n)\\s*-?\\s*Category:\\s*(\\w+)",
+                "(?:^|\\n)\\s*-?\\s*(?:Category|Classification):\\s*(\\w+)",
                 java.util.regex.Pattern.CASE_INSENSITIVE);
         final var matcher = categoryPattern.matcher(trimmed);
         if (matcher.find()) {
@@ -167,9 +183,16 @@ public final class OpenAiClassifier {
                 if (cat.equalsIgnoreCase(extracted)) return cat;
             }
         }
-        // Fallback: check if content contains category name as substring
+        // Fallback: check if content starts with or prominently contains a category name
+        // Only match category as a word boundary to avoid false matches in reasoning text
         for (final var cat : Taxonomy.categories()) {
-            if (trimmed.toLowerCase().contains(cat.toLowerCase())) return cat;
+            final var wordBoundary = java.util.regex.Pattern.compile(
+                    "\\b" + cat + "\\b", java.util.regex.Pattern.CASE_INSENSITIVE);
+            final var wordMatcher = wordBoundary.matcher(trimmed);
+            if (wordMatcher.find() && wordMatcher.start() < 50) {
+                // Only accept if the match appears near the start (likely the classification, not reasoning)
+                return cat;
+            }
         }
         return "Unknown";
     }

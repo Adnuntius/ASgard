@@ -1,6 +1,8 @@
 package org.asgard;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
+import org.asgard.registry.RegistryDatabase;
+import org.asgard.registry.RegistryDatabaseBuilder;
 
 import java.io.IOException;
 import java.net.http.HttpClient;
@@ -32,25 +34,45 @@ public final class AsnClassifierApp {
 
         final var state = new StatePaths(options.stateDir());
         state.ensureDirectories();
-        final var config = new ConfigManager(state.configFile()).loadOrCreate();
+        final var configManager = new ConfigManager(state.configFile());
+        final var config = configManager.loadOrCreate();
+        final var arinApiKey = normalizeKey(options.arinApiKey());
+        final var configToUse = arinApiKey != null && !arinApiKey.equals(config.arinApiKey())
+                ? new Config(config.model(), arinApiKey)
+                : config;
+        if (configToUse != config) {
+            configManager.save(configToUse);
+        }
 
-        final var modelToUse = config.model();
-        System.out.printf("Model: %s | RDAP: %s | OpenAI: %s | State: %s%n",
-                modelToUse, options.rdapBaseUri(), options.openAiBaseUri(), state.baseDir());
+        final var modelToUse = configToUse.model();
+        System.out.printf("Model: %s | Registry cache: %s | OpenAI: %s | State: %s%n",
+                modelToUse, state.registryDatabaseFile(), options.openAiBaseUri(), state.baseDir());
 
         final var registryClient = new AsnRegistryClient(httpClient, options.registrySources(), options.rdapTimeout());
         final var allocationCache = new AllocationCache(registryClient, mapper, state.allocationsDir());
-        final var rdapClient = new RdapClient(httpClient, mapper, options.rdapBaseUri(), options.rdapTimeout());
         final var isReprocessing = !options.reprocessAsns().isEmpty();
+        final var logDir = createRunLogDir(state);
+        System.out.println("OpenAI log: " + logDir);
+        final var logger = new OpenAiRequestLogger(logDir, mapper);
         final var classifier = new OpenAiClassifier(httpClient, mapper, options.openAiBaseUri(), modelToUse,
-                options.apiKey(), options.openAiTimeout(), isReprocessing);
+                options.apiKey(), options.openAiTimeout(), isReprocessing, logger);
 
-        final var allocations = allocationCache.loadAllocations(config).stream()
+        final var needRegistryBuild = options.refreshRegistryDatabase() || !Files.exists(state.registryDatabaseFile());
+        if (needRegistryBuild) {
+            new RegistryDatabaseBuilder(state.registryDatabaseFile(), registryClient, mapper,
+                    httpClient, configManager, configToUse, arinApiKey, options.skipArinBulk()).build();
+        }
+        final var registryDatabase = new RegistryDatabase(state.registryDatabaseFile(), mapper);
+        if (registryDatabase.isEmpty()) {
+            throw new IllegalStateException("Registry cache missing or empty at " + state.registryDatabaseFile()
+                    + ". Re-run with --refresh-registry-db.");
+        }
+
+        final var allocations = allocationCache.loadAllocations(options.refreshAllocations()).stream()
                 .sorted(Comparator.comparingLong(AsnAllocation::startAsn))
                 .toList();
         if (allocations.isEmpty()) throw new IllegalStateException("No ASN allocations downloaded");
-        System.out.printf("Fetched %,d allocation blocks (cache TTL %d hours)%n",
-                allocations.size(), config.registryTtl().toHours());
+        System.out.printf("Loaded %,d allocation blocks%n", allocations.size());
 
         final var outputFile = state.outputFile(options.outputFile());
         if (outputFile.getParent() != null) Files.createDirectories(outputFile.getParent());
@@ -61,16 +83,17 @@ public final class AsnClassifierApp {
                     options.reprocessAsns().size(), options.reprocessAsns());
             removeAsnsFromOutput(outputFile, mapper, options.reprocessAsns());
             try (var writer = Files.newBufferedWriter(outputFile, StandardCharsets.UTF_8, APPEND, CREATE)) {
-                reprocessSpecificAsns(options.reprocessAsns(), rdapClient, classifier, writer);
+                reprocessSpecificAsns(options.reprocessAsns(), registryDatabase, classifier, writer,
+                        options.acceptUnknowns());
             }
             System.out.println("Classification complete -> " + outputFile);
             return;
         }
 
-        final var processedLoad = loadProcessed(outputFile, mapper);
+        final var processedLoad = loadProcessed(outputFile, mapper, options.acceptUnknowns());
         final var processed = processedLoad.processed();
         if (!processed.isEmpty()) System.out.printf("Skipping %,d ASNs already classified%n", processed.size());
-        if (!processedLoad.unknowns().isEmpty()) {
+        if (!options.acceptUnknowns() && !processedLoad.unknowns().isEmpty()) {
             logUnknowns(processedLoad.unknowns().size(), processedLoad.unknownSamples(), "entity/category");
             rewriteKnownEntries(outputFile, mapper, processed);
         }
@@ -88,7 +111,8 @@ public final class AsnClassifierApp {
         System.out.printf("Preparing to classify %,d ASNs starting at AS%d%n", totalToProcess, startAt);
 
         try (var writer = Files.newBufferedWriter(outputFile, StandardCharsets.UTF_8, APPEND, CREATE)) {
-            runPipeline(allocations, processed, options.limit(), rdapClient, classifier, writer, totalToProcess, startAt);
+            runPipeline(allocations, processed, options.limit(), registryDatabase, classifier, writer,
+                    totalToProcess, startAt, options.acceptUnknowns());
         }
         System.out.println("Classification complete -> " + outputFile);
     }
@@ -97,23 +121,23 @@ public final class AsnClassifierApp {
             java.util.List<AsnAllocation> allocations,
             Set<Long> processed,
             long limit,
-            RdapClient rdapClient,
+            RegistryDatabase registryDatabase,
             OpenAiClassifier classifier,
             java.io.BufferedWriter writer,
             long totalToProcess,
-            long startAt) throws IOException {
+            long startAt,
+            boolean acceptUnknowns) throws IOException {
         final var summaryEvery = Math.max(1, totalToProcess / 1000);
         long processedCount = 0;
         long tokenApprox = 0;
         final Iterator<Long> iterator = pendingIterator(allocations, processed, limit, startAt);
         while (iterator.hasNext()) {
             final var asn = iterator.next();
-            final var metadata = rdapClient.lookup(asn);
+            final var metadata = registryDatabase.lookup(asn);
             FinalClassification output;
             if (metadata.isEmpty()) {
-                System.err.printf("No RDAP record for AS%d (base %s, fallback rdap.org)%n",
-                        asn, rdapClient.baseUri());
-                output = new FinalClassification(asn, "Unknown", "Unknown", "Unknown");
+                throw new IllegalStateException(
+                        "Registry cache missing ASN " + asn + ". Re-run with --refresh-registry-db.");
             } else {
                 try {
                     final var response = classifier.classifyWithUsage(metadata.get());
@@ -127,7 +151,7 @@ public final class AsnClassifierApp {
                     throw ex;
                 }
             }
-            if (isUnknown(output.name()) || isUnknown(output.organization()) || isUnknown(output.category())) {
+            if (shouldSkipUnknowns(output, acceptUnknowns)) {
                 System.err.printf("Skipping write for AS%d due to Unknown fields%n", asn);
                 continue;
             }
@@ -231,7 +255,7 @@ public final class AsnClassifierApp {
         return counted;
     }
 
-    private static ProcessedLoad loadProcessed(Path outputFile, ObjectMapper mapper) {
+    private static ProcessedLoad loadProcessed(Path outputFile, ObjectMapper mapper, boolean acceptUnknowns) {
         if (!Files.exists(outputFile)) {
             return new ProcessedLoad(new HashSet<>(), new java.util.LinkedHashSet<>(), List.of());
         }
@@ -251,8 +275,8 @@ public final class AsnClassifierApp {
                 if (classification == null) continue;
                 final var asn = classification.asn();
                 if (asn <= 0) continue;
-                if (isUnknown(classification.name()) || isUnknown(classification.organization())
-                        || isUnknown(classification.category())) {
+                if (!acceptUnknowns && (isUnknown(classification.name()) || isUnknown(classification.organization())
+                        || isUnknown(classification.category()))) {
                     unknownSet.add(asn);
                 } else {
                     processed.add(asn);
@@ -464,15 +488,15 @@ public final class AsnClassifierApp {
         Files.move(tempFile, outputFile, java.nio.file.StandardCopyOption.REPLACE_EXISTING);
     }
 
-    private static void reprocessSpecificAsns(List<Long> asns, RdapClient rdapClient, OpenAiClassifier classifier,
-                                              java.io.BufferedWriter writer) throws IOException {
+    private static void reprocessSpecificAsns(List<Long> asns, RegistryDatabase registryDatabase,
+                                              OpenAiClassifier classifier, java.io.BufferedWriter writer,
+                                              boolean acceptUnknowns) throws IOException {
         for (final var asn : asns) {
-            final var metadata = rdapClient.lookup(asn);
+            final var metadata = registryDatabase.lookup(asn);
             FinalClassification output;
             if (metadata.isEmpty()) {
-                System.err.printf("No RDAP record for AS%d (base %s, fallback rdap.org)%n",
-                        asn, rdapClient.baseUri());
-                output = new FinalClassification(asn, "Unknown", "Unknown", "Unknown");
+                throw new IllegalStateException(
+                        "Registry cache missing ASN " + asn + ". Re-run with --refresh-registry-db.");
             } else {
                 try {
                     final var response = classifier.classifyWithUsage(metadata.get());
@@ -485,12 +509,29 @@ public final class AsnClassifierApp {
                     throw ex;
                 }
             }
-            if (isUnknown(output.name()) || isUnknown(output.organization()) || isUnknown(output.category())) {
+            if (shouldSkipUnknowns(output, acceptUnknowns)) {
                 System.err.printf("Skipping write for AS%d due to Unknown fields%n", asn);
                 continue;
             }
             writer.write(toSeparatedLine(output));
             writer.newLine();
         }
+    }
+
+    static boolean shouldSkipUnknowns(FinalClassification output, boolean acceptUnknowns) {
+        if (acceptUnknowns) return false;
+        return isUnknown(output.name()) || isUnknown(output.organization()) || isUnknown(output.category());
+    }
+
+    private static Path createRunLogDir(StatePaths state) {
+        final var timestamp = java.time.ZonedDateTime.now(java.time.ZoneOffset.UTC)
+                .format(java.time.format.DateTimeFormatter.ofPattern("yyyyMMdd'T'HHmmss'Z'"));
+        return state.logsDir().resolve(timestamp);
+    }
+
+    private static String normalizeKey(String value) {
+        if (value == null) return null;
+        final var trimmed = value.trim();
+        return trimmed.isEmpty() ? null : trimmed;
     }
 }
