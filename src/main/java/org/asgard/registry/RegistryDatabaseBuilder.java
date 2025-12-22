@@ -110,11 +110,12 @@ public final class RegistryDatabaseBuilder {
     }
 
     private Map<Long, RpslObject> downloadRpsl(Path tempDir) throws IOException, InterruptedException {
+        // LACNIC doesn't provide public RPSL database access - requires special bulk whois request
+        // LACNIC ASN data comes from delegated-extended file instead
         final var targets = List.of(
                 new DownloadTarget("https://ftp.ripe.net/ripe/dbase/split/ripe.db.aut-num.gz", "ripe aut-num"),
                 new DownloadTarget("https://ftp.apnic.net/apnic/whois/apnic.db.aut-num.gz", "apnic aut-num"),
                 new DownloadTarget("https://ftp.afrinic.net/pub/dbase/afrinic.db.gz", "afrinic aut-num"),
-                new DownloadTarget("https://ftp.lacnic.net/pub/stats/lacnic/dbase/lacnic.db.gz", "lacnic aut-num"),
                 new DownloadTarget("https://ftp.arin.net/pub/rr/arin.db.gz", "arin aut-num")
         );
         final Map<Long, RpslObject> byAsn = new HashMap<>();
@@ -146,10 +147,12 @@ public final class RegistryDatabaseBuilder {
             System.out.println("Skipping ARIN bulk download (--skip-arin-bulk)");
             return ArinBulkData.empty();
         }
-        final var arinFile = tempDir.resolve("arin_asns.xml");
+        final var asnsFile = tempDir.resolve("arin_asns.xml");
+        final var orgsFile = tempDir.resolve("arin_orgs.xml");
+        final var pocsFile = tempDir.resolve("arin_pocs.xml");
         final var keySource = resolveArinApiKeyWithSource();
         var apiKey = keySource.key();
-        var arinData = tryDownloadAndParseArinBulk(apiKey, arinFile);
+        var arinData = tryDownloadAndParseArinBulkThreePass(apiKey, asnsFile, orgsFile, pocsFile);
 
         // If download failed or data is empty, and key came from config, delete it and re-prompt
         if ((arinData == null || arinData.asns().isEmpty()) && "config".equals(keySource.source())) {
@@ -158,7 +161,7 @@ public final class RegistryDatabaseBuilder {
             apiKey = promptForArinKey();
             if (apiKey != null) {
                 persistArinApiKey(apiKey);
-                arinData = tryDownloadAndParseArinBulk(apiKey, arinFile);
+                arinData = tryDownloadAndParseArinBulkThreePass(apiKey, asnsFile, orgsFile, pocsFile);
             }
         }
 
@@ -174,17 +177,33 @@ public final class RegistryDatabaseBuilder {
         return arinData;
     }
 
-    private ArinBulkData tryDownloadAndParseArinBulk(String apiKey, Path arinFile) throws IOException {
-        final var temp = tryDownloadArinBulk(apiKey);
-        if (temp.isEmpty()) return null;
-        Files.move(temp.get(), arinFile, java.nio.file.StandardCopyOption.REPLACE_EXISTING);
-        System.out.printf("Downloaded ARIN bulk data to %s%n", arinFile);
-        return AsnBulkDump.parseArinBulk(arinFile);
+    private ArinBulkData tryDownloadAndParseArinBulkThreePass(String apiKey, Path asnsFile, Path orgsFile, Path pocsFile) throws IOException {
+        final var asnsTemp = tryDownloadArinFile(apiKey, "asns.xml");
+        if (asnsTemp.isEmpty()) return null;
+        Files.move(asnsTemp.get(), asnsFile, java.nio.file.StandardCopyOption.REPLACE_EXISTING);
+        System.out.printf("Downloaded ARIN ASNs to %s%n", asnsFile);
+
+        final var orgsTemp = tryDownloadArinFile(apiKey, "orgs.xml");
+        if (orgsTemp.isEmpty()) {
+            throw new IOException("Failed to download ARIN orgs.xml - full org data is required for classification");
+        }
+        Files.move(orgsTemp.get(), orgsFile, java.nio.file.StandardCopyOption.REPLACE_EXISTING);
+        System.out.printf("Downloaded ARIN Orgs to %s%n", orgsFile);
+
+        final var pocsTemp = tryDownloadArinFile(apiKey, "pocs.xml");
+        if (pocsTemp.isEmpty()) {
+            throw new IOException("Failed to download ARIN pocs.xml - POC email domains are required for classification");
+        }
+        Files.move(pocsTemp.get(), pocsFile, java.nio.file.StandardCopyOption.REPLACE_EXISTING);
+        System.out.printf("Downloaded ARIN POCs to %s%n", pocsFile);
+
+        return AsnBulkDump.parseArinBulkThreePass(asnsFile, orgsFile, pocsFile);
     }
 
-    private Optional<Path> tryDownloadArinBulk(String apiKey) {
-        final var url = "https://accountws.arin.net/public/rest/downloads/bulkwhois/asns.xml?apikey="
+    private Optional<Path> tryDownloadArinFile(String apiKey, String fileName) {
+        final var url = "https://accountws.arin.net/public/rest/downloads/bulkwhois/" + fileName + "?apikey="
                 + URLEncoder.encode(apiKey, StandardCharsets.UTF_8);
+        System.out.printf("Downloading ARIN %s...%n", fileName);
         return downloadToTemp(URI.create(url));
     }
 
@@ -294,10 +313,18 @@ public final class RegistryDatabaseBuilder {
         String get() throws IOException;
     }
 
+    private static final int DOWNLOAD_MAX_RETRIES = 3;
+    private static final long DOWNLOAD_RETRY_DELAY_MS = 5000;
+
     private Optional<Path> downloadToTemp(URI uri) {
+        return downloadToTempWithRetries(uri, DOWNLOAD_MAX_RETRIES);
+    }
+
+    private Optional<Path> downloadToTempWithRetries(URI uri, int retriesLeft) {
+        // Use longer timeout for bulk downloads (10 minutes for multi-GB files)
         final var request = HttpRequest.newBuilder()
                 .uri(uri)
-                .timeout(java.time.Duration.ofSeconds(45))
+                .timeout(java.time.Duration.ofMinutes(10))
                 .GET()
                 .build();
         try {
@@ -321,7 +348,18 @@ public final class RegistryDatabaseBuilder {
             }
             return Optional.of(temp);
         } catch (Exception ex) {
-            System.err.printf("Download error for %s: %s%n", uri, ex.getMessage());
+            if (retriesLeft > 0) {
+                System.err.printf("Download error for %s: %s (retrying in %.0fs, %d retries left)%n",
+                        uri, ex.getMessage(), DOWNLOAD_RETRY_DELAY_MS / 1000.0, retriesLeft);
+                try {
+                    Thread.sleep(DOWNLOAD_RETRY_DELAY_MS);
+                } catch (InterruptedException ie) {
+                    Thread.currentThread().interrupt();
+                    return Optional.empty();
+                }
+                return downloadToTempWithRetries(uri, retriesLeft - 1);
+            }
+            System.err.printf("Download error for %s: %s (no retries left)%n", uri, ex.getMessage());
             return Optional.empty();
         }
     }

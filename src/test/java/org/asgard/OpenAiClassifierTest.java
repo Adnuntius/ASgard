@@ -68,7 +68,7 @@ class OpenAiClassifierTest {
     }
 
     @Test
-    void fallsBackWhenResponseIsTruncatedAndEmpty() {
+    void throwsWhenResponseIsTruncatedAndEmpty() {
         final var truncated = """
                 {
                   "choices": [
@@ -91,8 +91,37 @@ class OpenAiClassifierTest {
         final var metadata = AsnMetadata.minimal(6, "AS6 Corp", "US", "AS6 Corp", "enterprise");
 
         assertThatThrownBy(() -> classifier.classify(metadata))
-                .hasMessageContaining("truncated");
+                .hasMessageContaining("Empty");
         assertThat(server.getRequestCount()).isEqualTo(1);
+    }
+
+    @Test
+    void extractsCategoryFromTruncatedResponseWhenCategoryPresent() throws Exception {
+        // Model wrote the category before getting cut off
+        final var truncated = """
+                {
+                  "choices": [
+                    {
+                      "finish_reason": "length",
+                      "message": {
+                        "content": "Enterprise\\n\\nReasoning: This ASN belongs to a corporate entity that operates..."
+                      }
+                    }
+                  ]
+                }
+                """;
+        server.enqueue(new MockResponse()
+                .setResponseCode(200)
+                .addHeader("Content-Type", "application/json")
+                .setBody(truncated));
+
+        final var classifier = new OpenAiClassifier(HttpClient.newHttpClient(), new ObjectMapper(),
+                server.url("/v1/").uri(), "gpt-5-nano", "test-key", Duration.ofSeconds(5));
+        final var metadata = AsnMetadata.minimal(100, "CORP-AS", "US", "Some Corp", "assigned");
+
+        final var result = classifier.classify(metadata);
+
+        assertThat(result.category()).isEqualTo("Enterprise");
     }
 
     @Test
@@ -154,5 +183,113 @@ class OpenAiClassifierTest {
 
         // Should extract "Infrastructure" from "Classification: Infrastructure", NOT "VPN" from reasoning
         assertThat(result.category()).isEqualTo("Infrastructure");
+    }
+
+    @Test
+    void extractsCategoryFromDashCategoryColonFormat() throws Exception {
+        // Model lists the category with its definition: "- Hosting: Datacenters, cloud providers..."
+        final var responseJson = """
+                {
+                  "choices": [
+                    {
+                      "finish_reason": "stop",
+                      "message": {
+                        "content": "Based on the information provided, classify ASN 567 as:\\n\\n- Hosting: Datacenters, cloud providers, VPS/bare-metal/colo, CDN\\n\\nReasoning: ASN 567 is registered to \\"LNET\\" in the US with a long-standing assignment (1990). While the exact service scope isn't specified, many early ASNs with such naming (LNET) typically align with hosting or data-center infrastructure. Therefore, the most fitting single category is Hosting."
+                      }
+                    }
+                  ]
+                }
+                """;
+        server.enqueue(new MockResponse()
+                .setResponseCode(200)
+                .addHeader("Content-Type", "application/json")
+                .setBody(responseJson));
+
+        final var classifier = new OpenAiClassifier(HttpClient.newHttpClient(), new ObjectMapper(),
+                server.url("/v1/").uri(), "gpt-5-nano", "test-key", Duration.ofSeconds(5));
+        final var metadata = AsnMetadata.minimal(567, "ASN-LNET-AS", "US", "LNET", "assigned");
+
+        final var result = classifier.classify(metadata);
+
+        // Should extract "Hosting" from "- Hosting:" pattern
+        assertThat(result.category()).isEqualTo("Hosting");
+    }
+
+    @Test
+    void retriesOnTransientErrors() throws Exception {
+        // First request fails with 503, second succeeds
+        server.enqueue(new MockResponse().setResponseCode(503).setBody("Service Unavailable"));
+        server.enqueue(new MockResponse()
+                .setResponseCode(200)
+                .addHeader("Content-Type", "application/json")
+                .setBody("""
+                        {"choices": [{"message": {"content": "ISP"}}]}
+                        """));
+
+        final var classifier = new OpenAiClassifier(HttpClient.newHttpClient(), new ObjectMapper(),
+                server.url("/v1/").uri(), "gpt-5-nano", "test-key", Duration.ofSeconds(5));
+        final var metadata = AsnMetadata.minimal(100, "TEST-AS", "US", "Test Org", "assigned");
+
+        final var result = classifier.classify(metadata);
+
+        assertThat(result.category()).isEqualTo("ISP");
+        assertThat(server.getRequestCount()).isEqualTo(2);
+    }
+
+    @Test
+    void retriesWithMoreTokensWhenTruncatedWithNoCategory() throws Exception {
+        // First response is truncated with no recognizable category (just reasoning text)
+        final var truncatedNoCategory = """
+                {
+                  "choices": [
+                    {
+                      "finish_reason": "length",
+                      "message": {
+                        "content": "This ASN appears to be associated with a telecommunications provider that offers..."
+                      }
+                    }
+                  ]
+                }
+                """;
+        // Second response with more tokens succeeds
+        final var successResponse = """
+                {
+                  "choices": [
+                    {
+                      "finish_reason": "stop",
+                      "message": {
+                        "content": "Category: ISP\\n\\nReasoning: This ASN is a telecommunications provider."
+                      }
+                    }
+                  ]
+                }
+                """;
+        server.enqueue(new MockResponse()
+                .setResponseCode(200)
+                .addHeader("Content-Type", "application/json")
+                .setBody(truncatedNoCategory));
+        server.enqueue(new MockResponse()
+                .setResponseCode(200)
+                .addHeader("Content-Type", "application/json")
+                .setBody(successResponse));
+
+        final var classifier = new OpenAiClassifier(HttpClient.newHttpClient(), new ObjectMapper(),
+                server.url("/v1/").uri(), "gpt-5-nano", "test-key", Duration.ofSeconds(5));
+        final var metadata = AsnMetadata.minimal(2541, "TEST-TELCO", "US", "Telco Corp", "assigned");
+
+        final var result = classifier.classify(metadata);
+
+        assertThat(result.category()).isEqualTo("ISP");
+        assertThat(server.getRequestCount()).isEqualTo(2);
+
+        // Verify first request used default tokens
+        final var firstRequest = server.takeRequest();
+        final var firstBody = new ObjectMapper().readTree(firstRequest.getBody().readUtf8());
+        assertThat(firstBody.path("max_completion_tokens").asInt()).isEqualTo(COMPLETION_TOKENS);
+
+        // Verify second request used extended tokens
+        final var secondRequest = server.takeRequest();
+        final var secondBody = new ObjectMapper().readTree(secondRequest.getBody().readUtf8());
+        assertThat(secondBody.path("max_completion_tokens").asInt()).isEqualTo(512);
     }
 }

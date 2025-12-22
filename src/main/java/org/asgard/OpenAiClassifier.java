@@ -48,10 +48,20 @@ public final class OpenAiClassifier {
         this.requestLogger = requestLogger;
     }
 
+    private static final int MAX_RETRIES = 5;
+    private static final long INITIAL_RETRY_DELAY_MS = 2000;
+    private static final long MAX_RETRY_DELAY_MS = 30000;
+    private static final int EXTENDED_COMPLETION_TOKENS = 512;
+
     public ClassificationResponse classifyWithUsage(AsnMetadata metadata) throws IOException, InterruptedException {
+        return classifyWithUsage(metadata, COMPLETION_TOKENS, false);
+    }
+
+    private ClassificationResponse classifyWithUsage(AsnMetadata metadata, int maxTokens, boolean isRetryWithMoreTokens)
+            throws IOException, InterruptedException {
         if (apiKey == null || apiKey.isBlank()) throw new IllegalStateException("OpenAI API key is missing");
         final var summary = metadataSummary(metadata);
-        final var requestBody = buildRequest(summary);
+        final var requestBody = buildRequest(summary, maxTokens);
         if (verbose) {
             System.out.println("\n=== OpenAI Request for AS" + metadata.asn() + " ===");
             System.out.println(requestBody);
@@ -66,7 +76,32 @@ public final class OpenAiClassifier {
                 .POST(HttpRequest.BodyPublishers.ofString(requestBody, StandardCharsets.UTF_8))
                 .build();
         final var approxTokens = Math.round(requestBody.length() / 4.0);
-        final var response = httpClient.send(request, HttpResponse.BodyHandlers.ofString());
+
+        HttpResponse<String> response = null;
+        IOException lastException = null;
+        for (int attempt = 0; attempt <= MAX_RETRIES; attempt++) {
+            try {
+                response = httpClient.send(request, HttpResponse.BodyHandlers.ofString());
+                if (!isRetryableStatus(response.statusCode())) break;
+                lastException = new IOException("OpenAI returned " + response.statusCode() + ": " + response.body());
+            } catch (IOException ex) {
+                lastException = ex;
+            }
+            if (attempt < MAX_RETRIES) {
+                final var delay = Math.min(INITIAL_RETRY_DELAY_MS * (1L << attempt), MAX_RETRY_DELAY_MS);
+                System.err.printf("AS%d: Retry %d/%d in %.1fs (%s)%n",
+                        metadata.asn(), attempt + 1, MAX_RETRIES, delay / 1000.0,
+                        lastException.getMessage().split("\n")[0]);
+                Thread.sleep(delay);
+            }
+        }
+        if (response == null || isRetryableStatus(response.statusCode())) {
+            if (requestLogger != null && response != null) {
+                requestLogger.logResponse(metadata, response.statusCode(), response.body(), null, approxTokens);
+            }
+            throw lastException != null ? lastException : new IOException("OpenAI request failed after retries");
+        }
+
         final var responseBody = response.body();
         if (verbose) {
             System.out.printf("\n=== OpenAI Response for AS%d (HTTP %d) ===%n", metadata.asn(), response.statusCode());
@@ -78,7 +113,19 @@ public final class OpenAiClassifier {
             }
             throw new IOException("OpenAI classification failed: " + response.statusCode() + " " + responseBody);
         }
-        final var classification = parseResponse(metadata, responseBody);
+
+        // Check for truncation and retry with more tokens if needed
+        final var parseResult = tryParseResponse(metadata, responseBody);
+        if (parseResult.truncatedWithNoCategory && !isRetryWithMoreTokens) {
+            System.err.printf("AS%d: Response truncated with no category found, retrying with %d tokens%n",
+                    metadata.asn(), EXTENDED_COMPLETION_TOKENS);
+            return classifyWithUsage(metadata, EXTENDED_COMPLETION_TOKENS, true);
+        }
+        if (parseResult.classification == null) {
+            throw new IOException(parseResult.error);
+        }
+
+        final var classification = parseResult.classification;
         if (verbose) {
             System.out.printf("\n=== Parsed Classification for AS%d ===%n", metadata.asn());
             System.out.printf("Name: %s%nOrganization: %s%nCategory: %s%n",
@@ -90,14 +137,18 @@ public final class OpenAiClassifier {
         return new ClassificationResponse(classification, approxTokens, responseBody);
     }
 
+    private static boolean isRetryableStatus(int status) {
+        return status == 429 || status == 500 || status == 502 || status == 503 || status == 504;
+    }
+
     public FinalClassification classify(AsnMetadata metadata) throws IOException, InterruptedException {
         return classifyWithUsage(metadata).classification();
     }
 
-    private String buildRequest(String summary) throws IOException {
+    private String buildRequest(String summary, int maxTokens) throws IOException {
         final var root = objectMapper.createObjectNode();
         root.put("model", model);
-        root.put("max_completion_tokens", COMPLETION_TOKENS);
+        root.put("max_completion_tokens", maxTokens);
         root.put("reasoning_effort", "minimal");
         final ArrayNode messages = root.putArray("messages");
         messages.add(message("system", Taxonomy.prompt()));
@@ -145,21 +196,43 @@ public final class OpenAiClassifier {
         return node;
     }
 
-    private FinalClassification parseResponse(AsnMetadata metadata, String body) throws IOException {
-        final var root = objectMapper.readTree(body);
-        final var firstChoice = root.path("choices").path(0);
-        final var finishReason = firstChoice.path("finish_reason").asText();
-        final var content = firstChoice.path("message").path("content").asText();
-        if ("length".equals(finishReason)) {
-            throw new IOException("OpenAI response truncated");
-        } else if (content == null || content.isBlank()) {
-            throw new IOException("Empty OpenAI response (finish_reason: " + finishReason + ")");
+    private record ParseResult(FinalClassification classification, boolean truncatedWithNoCategory, String error) {
+        static ParseResult success(FinalClassification classification) {
+            return new ParseResult(classification, false, null);
         }
-        final var category = normalizeCategory(content);
-        final var name = metadata.name() != null && !metadata.name().isBlank()
-                ? metadata.name() : "Unknown";
-        final var organization = metadata.entityForClassification().orElse("Unknown");
-        return new FinalClassification(metadata.asn(), name, organization, category);
+        static ParseResult truncatedNoCategory(String error) {
+            return new ParseResult(null, true, error);
+        }
+        static ParseResult failure(String error) {
+            return new ParseResult(null, false, error);
+        }
+    }
+
+    private ParseResult tryParseResponse(AsnMetadata metadata, String body) {
+        try {
+            final var root = objectMapper.readTree(body);
+            final var firstChoice = root.path("choices").path(0);
+            final var finishReason = firstChoice.path("finish_reason").asText();
+            final var content = firstChoice.path("message").path("content").asText();
+            final var truncated = "length".equals(finishReason);
+
+            if (content == null || content.isBlank()) {
+                return ParseResult.failure("Empty OpenAI response (finish_reason: " + finishReason + ")");
+            }
+
+            final var category = normalizeCategory(content);
+            if (truncated && "Unknown".equals(category)) {
+                return ParseResult.truncatedNoCategory("OpenAI response truncated and no category found in: " +
+                        content.substring(0, Math.min(100, content.length())) + "...");
+            }
+
+            final var name = metadata.name() != null && !metadata.name().isBlank()
+                    ? metadata.name() : "Unknown";
+            final var organization = metadata.entityForClassification().orElse("Unknown");
+            return ParseResult.success(new FinalClassification(metadata.asn(), name, organization, category));
+        } catch (Exception e) {
+            return ParseResult.failure("Failed to parse OpenAI response: " + e.getMessage());
+        }
     }
 
     private String normalizeCategory(String content) {
@@ -172,7 +245,7 @@ public final class OpenAiClassifier {
             if (Taxonomy.categories().contains(extracted)) return extracted;
         } catch (Exception ignored) {
         }
-        // Extract category from common patterns like "Category: X", "Classification: X", or "- Category: X"
+        // Extract category from common patterns like "Category: X", "Classification: X"
         final var categoryPattern = java.util.regex.Pattern.compile(
                 "(?:^|\\n)\\s*-?\\s*(?:Category|Classification):\\s*(\\w+)",
                 java.util.regex.Pattern.CASE_INSENSITIVE);
@@ -183,16 +256,19 @@ public final class OpenAiClassifier {
                 if (cat.equalsIgnoreCase(extracted)) return cat;
             }
         }
-        // Fallback: check if content starts with or prominently contains a category name
-        // Only match category as a word boundary to avoid false matches in reasoning text
+        // Match "- CategoryName:" pattern (model lists category with its definition)
+        for (final var cat : Taxonomy.categories()) {
+            final var catPattern = java.util.regex.Pattern.compile(
+                    "(?:^|\\n)\\s*-\\s*" + cat + "\\s*:",
+                    java.util.regex.Pattern.CASE_INSENSITIVE);
+            if (catPattern.matcher(trimmed).find()) return cat;
+        }
+        // Fallback: find first category mentioned as a complete word in the first 100 chars
+        final var prefix = trimmed.length() > 100 ? trimmed.substring(0, 100) : trimmed;
         for (final var cat : Taxonomy.categories()) {
             final var wordBoundary = java.util.regex.Pattern.compile(
                     "\\b" + cat + "\\b", java.util.regex.Pattern.CASE_INSENSITIVE);
-            final var wordMatcher = wordBoundary.matcher(trimmed);
-            if (wordMatcher.find() && wordMatcher.start() < 50) {
-                // Only accept if the match appears near the start (likely the classification, not reasoning)
-                return cat;
-            }
+            if (wordBoundary.matcher(prefix).find()) return cat;
         }
         return "Unknown";
     }

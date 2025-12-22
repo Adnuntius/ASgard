@@ -7,14 +7,35 @@ To use the default gpt-5-nano put in your OpenAI `KEY` and specify `N` ASNs to f
 ./gradlew run --args="--api-key=KEY --limit=N"
 ```
 
-OpenAI request/response payloads are logged automatically under `~/.asgard/logs/{timestamp}/asn-{asn}.json`.
-This will output a TSV file at the path from `--output` (defaults to an `.asgard` directory under your home dir).
- - If you omit the N it will run through all ~120k which will use about $5 of open AI credits with the default model. 
-A registry cache (see below) will stop it making lookups to the registry for each.
- - If you want the reasoning for any responses, you can reprocess it and show this with `--reprocess=1,3,5`
+Results are written as TSV to `~/.asgard/asn-classifications.tsv` (specify a different path with `--output`).
 
-Registry cache lifecycle:
-- If `~/.asgard/cache/registry/registry-cache.ndjson` is missing, the app automatically downloads delegated data from all five RIRs plus ARIN bulk whois (prompts once for an ARIN API key, or uses `--arin-api-key`/env vars, then saves it in `asgard.conf`), builds the cache, and proceeds.
-- If the cache exists, it is reused. Pass `--refresh-registry-db` to rebuild it end-to-end and replace the existing file.
-- Intermediate artifacts are kept in a temp directory during the build and removed after the final cache file is written.
-- `--refresh-allocations` downloads a fresh ASN allocation list into `~/.asgard/cache/allocations`; otherwise the most recent cached file is reused.
+OpenAI request/response payloads are logged automatically under `~/.asgard/logs/{timestamp}/asn-{asn}.json`.
+
+## Options
+
+| Flag | Description |
+|------|-------------|
+| `--api-key=KEY` | OpenAI API key |
+| `--arin-api-key=KEY` | ARIN bulk whois API key |
+| `--model=MODEL` | OpenAI model (default: gpt-5-nano) |
+| `--limit=N` | Number of ASNs to classify (default: 50) |
+| `--output=PATH` | Output TSV file path |
+| `--reprocess=1,3,5` | Re-classify specific ASNs and show reasoning |
+| `--accept-unknowns` | Persist "Unknown" classifications instead of retrying |
+| `--skip-arin-bulk` | Skip ARIN bulk download (some ASNs will show "Unknown") |
+| `--refresh-registry-db` | Force rebuild of registry cache |
+| `--refresh-allocations` | Download fresh ASN allocation list |
+
+## Allocation and Registry Caches
+
+Allocation data is cached in `~/.asgard/cache/allocations/`. Pass `--refresh-allocations` to download fresh data.
+
+The registry cache at `~/.asgard/cache/registry/registry-cache.ndjson` stores ASN metadata from all five RIRs.
+
+- If missing, the app automatically downloads delegated data from all RIRs plus ARIN bulk whois, builds the cache, and proceeds
+- If present, it is reused. Pass `--refresh-registry-db` to rebuild
+- ARIN API key is saved in `~/.asgard/asgard.conf` after first prompt. The build will fail if your ARIN API key doesn't 
+have bulk whois access. If the saved API key fails, it will be removed from config and you'll be prompted for a new one.
+- To proceed without ARIN bulk data and use only ARIN's public Internet Routing Registry, add `--skip-arin-bulk`.
+
+
