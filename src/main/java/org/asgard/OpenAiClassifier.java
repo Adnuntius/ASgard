@@ -339,17 +339,19 @@ public final class OpenAiClassifier {
             if (Taxonomy.categories().contains(extracted)) return extracted;
         } catch (Exception ignored) {
         }
-        // Extract category from common patterns like "Category: X", "Classification: X"
+        // Extract category from patterns like "Category: X", "Best fit category: X", "Final category: X"
         final var categoryPattern = java.util.regex.Pattern.compile(
-                "(?:^|\\n)\\s*-?\\s*(?:Category|Classification):\\s*(\\w+)",
+                "(?:^|\\n)[^\\n]*?(?:Category|Classification):\\s*(\\w+)",
                 java.util.regex.Pattern.CASE_INSENSITIVE);
         final var matcher = categoryPattern.matcher(trimmed);
-        if (matcher.find()) {
+        String lastMatch = null;
+        while (matcher.find()) {
             final var extracted = matcher.group(1);
             for (final var cat : Taxonomy.categories()) {
-                if (cat.equalsIgnoreCase(extracted)) return cat;
+                if (cat.equalsIgnoreCase(extracted)) lastMatch = cat;
             }
         }
+        if (lastMatch != null) return lastMatch; // Return the last match (usually the final answer)
         // Match "- CategoryName:" pattern (model lists category with its definition)
         for (final var cat : Taxonomy.categories()) {
             final var catPattern = java.util.regex.Pattern.compile(
