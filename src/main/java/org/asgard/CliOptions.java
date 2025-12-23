@@ -12,7 +12,8 @@ public record CliOptions(List<URI> registrySources, URI rdapBaseUri, URI openAiB
                          String apiKey, String arinApiKey,
                          boolean acceptUnknowns, long limit, Path outputFile, Duration rdapTimeout,
                          Duration openAiTimeout, Path stateDir, List<Long> reprocessAsns,
-                         boolean refreshAllocations, boolean refreshRegistryDatabase, boolean skipArinBulk) {
+                         boolean refreshAllocations, boolean refreshRegistryDatabase, boolean skipArinBulk,
+                         long tokensPerMinute, long maxContextTokens) {
 
     public static CliOptions parse(String[] args) {
         final var parsed = parseArgs(args);
@@ -27,7 +28,7 @@ public record CliOptions(List<URI> registrySources, URI rdapBaseUri, URI openAiB
                 System.getenv("ASGARD_ARIN_API_KEY"),
                 System.getenv("ARIN_API_KEY"));
         final var acceptUnknowns = parseBoolean(parsed, "accept-unknowns");
-        final var limit = parseLong(parsed.get("limit"), 50);
+        final var limit = parseLong(parsed.get("limit"), 0); // 0 = no limit
         final var output = parsed.containsKey("output") ? Path.of(parsed.get("output")) : null;
         final var rdapTimeout = Duration.ofSeconds(parseLong(parsed.get("rdap-timeout-seconds"), 10));
         final var openAiTimeout = Duration.ofSeconds(parseLong(parsed.get("openai-timeout-seconds"), 30));
@@ -35,11 +36,13 @@ public record CliOptions(List<URI> registrySources, URI rdapBaseUri, URI openAiB
                 System.getenv().getOrDefault("ASGARD_STATE_DIR",
                         System.getProperty("user.home") + "/.asgard")));
         final var reprocessAsns = parseAsnList(parsed.get("reprocess"));
+        final var tokensPerMinute = parseLong(parsed.get("tpm-limit"), 200_000);
+        final var maxContextTokens = parseLong(parsed.get("max-context"), 250_000);
         return new CliOptions(registry, rdapBase, openAiBase, model, apiKey, arinApiKey,
                 acceptUnknowns, limit, output, rdapTimeout,
                 openAiTimeout, stateDir, reprocessAsns, parseBoolean(parsed, "refresh-allocations"),
                 parseBoolean(parsed, "refresh-registry-db") || parseBoolean(parsed, "refresh-rdap-db"),
-                parseBoolean(parsed, "skip-arin-bulk"));
+                parseBoolean(parsed, "skip-arin-bulk"), tokensPerMinute, maxContextTokens);
     }
 
     private static Map<String, String> parseArgs(String[] args) {

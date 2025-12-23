@@ -12,7 +12,6 @@ import java.time.Duration;
 
 import static org.asgard.OpenAiClassifier.COMPLETION_TOKENS;
 import static org.assertj.core.api.Assertions.assertThat;
-import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 class OpenAiClassifierTest {
     private MockWebServer server;
@@ -68,8 +67,8 @@ class OpenAiClassifierTest {
     }
 
     @Test
-    void throwsWhenResponseIsTruncatedAndEmpty() {
-        final var truncated = """
+    void retriesWithMoreTokensWhenTruncatedAndEmpty() throws Exception {
+        final var truncatedEmpty = """
                 {
                   "choices": [
                     {
@@ -81,18 +80,41 @@ class OpenAiClassifierTest {
                   ]
                 }
                 """;
+        final var successResponse = """
+                {
+                  "choices": [
+                    {
+                      "finish_reason": "stop",
+                      "message": {
+                        "content": "Enterprise"
+                      }
+                    }
+                  ]
+                }
+                """;
         server.enqueue(new MockResponse()
                 .setResponseCode(200)
                 .addHeader("Content-Type", "application/json")
-                .setBody(truncated));
+                .setBody(truncatedEmpty));
+        server.enqueue(new MockResponse()
+                .setResponseCode(200)
+                .addHeader("Content-Type", "application/json")
+                .setBody(successResponse));
 
         final var classifier = new OpenAiClassifier(HttpClient.newHttpClient(), new ObjectMapper(),
                 server.url("/v1/").uri(), "gpt-5-nano", "test-key", Duration.ofSeconds(5));
         final var metadata = AsnMetadata.minimal(6, "AS6 Corp", "US", "AS6 Corp", "enterprise");
 
-        assertThatThrownBy(() -> classifier.classify(metadata))
-                .hasMessageContaining("Empty");
-        assertThat(server.getRequestCount()).isEqualTo(1);
+        final var result = classifier.classify(metadata);
+
+        assertThat(result.category()).isEqualTo("Enterprise");
+        assertThat(server.getRequestCount()).isEqualTo(2);
+
+        // Verify retry used extended tokens
+        server.takeRequest(); // skip first
+        final var secondRequest = server.takeRequest();
+        final var secondBody = new ObjectMapper().readTree(secondRequest.getBody().readUtf8());
+        assertThat(secondBody.path("max_completion_tokens").asInt()).isEqualTo(512);
     }
 
     @Test

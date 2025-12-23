@@ -3,6 +3,10 @@ package org.asgard;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ArrayNode;
 import com.fasterxml.jackson.databind.node.ObjectNode;
+import com.knuddels.jtokkit.Encodings;
+import com.knuddels.jtokkit.api.Encoding;
+import com.knuddels.jtokkit.api.EncodingRegistry;
+import com.knuddels.jtokkit.api.EncodingType;
 
 import java.io.IOException;
 import java.net.URI;
@@ -14,6 +18,9 @@ import java.time.Duration;
 
 public final class OpenAiClassifier {
     public static final int COMPLETION_TOKENS = 256;
+    private static final EncodingRegistry ENCODING_REGISTRY = Encodings.newDefaultEncodingRegistry();
+    private static final Encoding TOKENIZER = ENCODING_REGISTRY.getEncoding(EncodingType.CL100K_BASE);
+
     private final HttpClient httpClient;
     private final ObjectMapper objectMapper;
     private final URI baseUri;
@@ -22,22 +29,29 @@ public final class OpenAiClassifier {
     private final Duration timeout;
     private final boolean verbose;
     private final OpenAiRequestLogger requestLogger;
+    private final TokenRateLimiter rateLimiter;
 
     public record ClassificationResponse(FinalClassification classification, long approximatePromptTokens, String rawResponseBody) {
     }
 
     public OpenAiClassifier(HttpClient httpClient, ObjectMapper objectMapper, URI baseUri, String model,
                             String apiKey, Duration timeout) {
-        this(httpClient, objectMapper, baseUri, model, apiKey, timeout, false, null);
+        this(httpClient, objectMapper, baseUri, model, apiKey, timeout, false, null, null);
     }
 
     public OpenAiClassifier(HttpClient httpClient, ObjectMapper objectMapper, URI baseUri, String model,
                             String apiKey, Duration timeout, boolean verbose) {
-        this(httpClient, objectMapper, baseUri, model, apiKey, timeout, verbose, null);
+        this(httpClient, objectMapper, baseUri, model, apiKey, timeout, verbose, null, null);
     }
 
     public OpenAiClassifier(HttpClient httpClient, ObjectMapper objectMapper, URI baseUri, String model,
                             String apiKey, Duration timeout, boolean verbose, OpenAiRequestLogger requestLogger) {
+        this(httpClient, objectMapper, baseUri, model, apiKey, timeout, verbose, requestLogger, null);
+    }
+
+    public OpenAiClassifier(HttpClient httpClient, ObjectMapper objectMapper, URI baseUri, String model,
+                            String apiKey, Duration timeout, boolean verbose, OpenAiRequestLogger requestLogger,
+                            TokenRateLimiter rateLimiter) {
         this.httpClient = httpClient;
         this.objectMapper = objectMapper;
         this.baseUri = baseUri.toString().endsWith("/") ? baseUri : URI.create(baseUri + "/");
@@ -46,11 +60,11 @@ public final class OpenAiClassifier {
         this.timeout = timeout;
         this.verbose = verbose;
         this.requestLogger = requestLogger;
+        this.rateLimiter = rateLimiter;
     }
 
     private static final int MAX_RETRIES = 5;
-    private static final long INITIAL_RETRY_DELAY_MS = 2000;
-    private static final long MAX_RETRY_DELAY_MS = 30000;
+    private static final long DEFAULT_RETRY_DELAY_MS = 5000;
     private static final int EXTENDED_COMPLETION_TOKENS = 512;
 
     public ClassificationResponse classifyWithUsage(AsnMetadata metadata) throws IOException, InterruptedException {
@@ -60,8 +74,33 @@ public final class OpenAiClassifier {
     private ClassificationResponse classifyWithUsage(AsnMetadata metadata, int maxTokens, boolean isRetryWithMoreTokens)
             throws IOException, InterruptedException {
         if (apiKey == null || apiKey.isBlank()) throw new IllegalStateException("OpenAI API key is missing");
-        final var summary = metadataSummary(metadata);
-        final var requestBody = buildRequest(summary, maxTokens);
+        var summary = metadataSummary(metadata);
+        var requestBody = buildRequest(summary, maxTokens);
+        var approxTokens = (long) TOKENIZER.countTokens(requestBody);
+
+        // Truncate if single request exceeds TPM or context limit
+        if (rateLimiter != null) {
+            final var maxTokensAllowed = Math.min(rateLimiter.tokensPerMinute(), rateLimiter.maxContextTokens());
+            if (approxTokens > maxTokensAllowed) {
+                final var originalTokens = approxTokens;
+                // Iteratively truncate summary until under limit
+                var targetChars = summary.length();
+                while (approxTokens > maxTokensAllowed && targetChars > 100) {
+                    targetChars = (int) (targetChars * 0.7); // Reduce by 30% each iteration
+                    summary = truncateSummary(summary, targetChars);
+                    requestBody = buildRequest(summary, maxTokens);
+                    approxTokens = TOKENIZER.countTokens(requestBody);
+                }
+                System.err.printf("AS%d: Truncated request from %d to %d tokens (limit: %d)%n",
+                        metadata.asn(), originalTokens, approxTokens, maxTokensAllowed);
+            }
+        }
+
+        // Wait for rate limit capacity
+        if (rateLimiter != null) {
+            rateLimiter.waitForCapacity(approxTokens, metadata.asn());
+        }
+
         if (verbose) {
             System.out.println("\n=== OpenAI Request for AS" + metadata.asn() + " ===");
             System.out.println(requestBody);
@@ -75,7 +114,6 @@ public final class OpenAiClassifier {
                 .header("Authorization", "Bearer " + apiKey)
                 .POST(HttpRequest.BodyPublishers.ofString(requestBody, StandardCharsets.UTF_8))
                 .build();
-        final var approxTokens = Math.round(requestBody.length() / 4.0);
 
         HttpResponse<String> response = null;
         IOException lastException = null;
@@ -88,7 +126,7 @@ public final class OpenAiClassifier {
                 lastException = ex;
             }
             if (attempt < MAX_RETRIES) {
-                final var delay = Math.min(INITIAL_RETRY_DELAY_MS * (1L << attempt), MAX_RETRY_DELAY_MS);
+                final var delay = extractRetryAfterMs(response);
                 System.err.printf("AS%d: Retry %d/%d in %.1fs (%s)%n",
                         metadata.asn(), attempt + 1, MAX_RETRIES, delay / 1000.0,
                         lastException.getMessage().split("\n")[0]);
@@ -134,11 +172,64 @@ public final class OpenAiClassifier {
         if (requestLogger != null) {
             requestLogger.logResponse(metadata, response.statusCode(), responseBody, classification, approxTokens);
         }
+        if (rateLimiter != null) {
+            rateLimiter.recordTokens(approxTokens);
+        }
         return new ClassificationResponse(classification, approxTokens, responseBody);
+    }
+
+    private static String truncateSummary(String summary, int maxChars) {
+        if (summary.length() <= maxChars) return summary;
+        // Truncate at last newline before maxChars to preserve field structure
+        final var truncated = summary.substring(0, maxChars);
+        final var lastNewline = truncated.lastIndexOf('\n');
+        return (lastNewline > 0 ? truncated.substring(0, lastNewline) : truncated) + "\n[truncated]";
     }
 
     private static boolean isRetryableStatus(int status) {
         return status == 429 || status == 500 || status == 502 || status == 503 || status == 504;
+    }
+
+    private static long extractRetryAfterMs(HttpResponse<?> response) {
+        if (response == null) return DEFAULT_RETRY_DELAY_MS;
+        // Try Retry-After header first (standard HTTP header, value in seconds)
+        final var retryAfter = response.headers().firstValue("Retry-After").orElse(null);
+        if (retryAfter != null) {
+            try {
+                return (long) (Double.parseDouble(retryAfter) * 1000) + 500; // add 500ms buffer
+            } catch (NumberFormatException ignored) {}
+        }
+        // Try OpenAI-specific rate limit reset headers (milliseconds until reset)
+        final var resetTokens = response.headers().firstValue("x-ratelimit-reset-tokens").orElse(null);
+        if (resetTokens != null) {
+            final var ms = parseDurationToMs(resetTokens);
+            if (ms > 0) return ms + 500;
+        }
+        final var resetRequests = response.headers().firstValue("x-ratelimit-reset-requests").orElse(null);
+        if (resetRequests != null) {
+            final var ms = parseDurationToMs(resetRequests);
+            if (ms > 0) return ms + 500;
+        }
+        return DEFAULT_RETRY_DELAY_MS;
+    }
+
+    private static long parseDurationToMs(String duration) {
+        // Parse durations like "1s", "500ms", "1m30s", "2m"
+        if (duration == null || duration.isBlank()) return 0;
+        long totalMs = 0;
+        final var pattern = java.util.regex.Pattern.compile("(\\d+(?:\\.\\d+)?)(ms|s|m|h)");
+        final var matcher = pattern.matcher(duration.toLowerCase());
+        while (matcher.find()) {
+            final var value = Double.parseDouble(matcher.group(1));
+            totalMs += switch (matcher.group(2)) {
+                case "ms" -> (long) value;
+                case "s" -> (long) (value * 1000);
+                case "m" -> (long) (value * 60_000);
+                case "h" -> (long) (value * 3_600_000);
+                default -> 0;
+            };
+        }
+        return totalMs;
     }
 
     public FinalClassification classify(AsnMetadata metadata) throws IOException, InterruptedException {
@@ -217,6 +308,9 @@ public final class OpenAiClassifier {
             final var truncated = "length".equals(finishReason);
 
             if (content == null || content.isBlank()) {
+                if (truncated) {
+                    return ParseResult.truncatedNoCategory("Empty OpenAI response (finish_reason: length)");
+                }
                 return ParseResult.failure("Empty OpenAI response (finish_reason: " + finishReason + ")");
             }
 

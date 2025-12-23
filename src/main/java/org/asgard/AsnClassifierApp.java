@@ -54,8 +54,10 @@ public final class AsnClassifierApp {
         final var logDir = createRunLogDir(state);
         System.out.println("OpenAI log: " + logDir);
         final var logger = new OpenAiRequestLogger(logDir, mapper);
+        final var rateLimiter = new TokenRateLimiter(options.tokensPerMinute(), options.maxContextTokens());
         final var classifier = new OpenAiClassifier(httpClient, mapper, options.openAiBaseUri(), modelToUse,
-                options.apiKey(), options.openAiTimeout(), isReprocessing, logger);
+                options.apiKey(), options.openAiTimeout(), isReprocessing, logger, rateLimiter);
+        final var rdapClient = new RdapClient(httpClient, mapper, options.rdapBaseUri(), options.rdapTimeout());
 
         final var needRegistryBuild = options.refreshRegistryDatabase() || !Files.exists(state.registryDatabaseFile());
         if (needRegistryBuild) {
@@ -83,9 +85,10 @@ public final class AsnClassifierApp {
                     options.reprocessAsns().size(), options.reprocessAsns());
             removeAsnsFromOutput(outputFile, mapper, options.reprocessAsns());
             try (var writer = Files.newBufferedWriter(outputFile, StandardCharsets.UTF_8, APPEND, CREATE)) {
-                reprocessSpecificAsns(options.reprocessAsns(), registryDatabase, classifier, writer,
+                reprocessSpecificAsns(options.reprocessAsns(), registryDatabase, rdapClient, classifier, writer,
                         options.acceptUnknowns());
             }
+            sortOutputByAsn(outputFile, mapper);
             System.out.println("Classification complete -> " + outputFile);
             return;
         }
@@ -94,7 +97,7 @@ public final class AsnClassifierApp {
         final var processed = processedLoad.processed();
         if (!processed.isEmpty()) System.out.printf("Skipping %,d ASNs already classified%n", processed.size());
         if (!options.acceptUnknowns() && !processedLoad.unknowns().isEmpty()) {
-            logUnknowns(processedLoad.unknowns().size(), processedLoad.unknownSamples(), "entity/category");
+            logUnknowns(processedLoad.unknowns().size(), processedLoad.unknownSamples(), "category");
             rewriteKnownEntries(outputFile, mapper, processed);
         }
 
@@ -111,9 +114,10 @@ public final class AsnClassifierApp {
         System.out.printf("Preparing to classify %,d ASNs starting at AS%d%n", totalToProcess, startAt);
 
         try (var writer = Files.newBufferedWriter(outputFile, StandardCharsets.UTF_8, APPEND, CREATE)) {
-            runPipeline(allocations, processed, options.limit(), registryDatabase, classifier, writer,
+            runPipeline(allocations, processed, options.limit(), registryDatabase, rdapClient, classifier, writer,
                     totalToProcess, startAt, options.acceptUnknowns());
         }
+        sortOutputByAsn(outputFile, mapper);
         System.out.println("Classification complete -> " + outputFile);
     }
 
@@ -122,6 +126,7 @@ public final class AsnClassifierApp {
             Set<Long> processed,
             long limit,
             RegistryDatabase registryDatabase,
+            RdapClient rdapClient,
             OpenAiClassifier classifier,
             java.io.BufferedWriter writer,
             long totalToProcess,
@@ -133,23 +138,30 @@ public final class AsnClassifierApp {
         final Iterator<Long> iterator = pendingIterator(allocations, processed, limit, startAt);
         while (iterator.hasNext()) {
             final var asn = iterator.next();
-            final var metadata = registryDatabase.lookup(asn);
-            FinalClassification output;
+            var metadata = registryDatabase.lookup(asn);
             if (metadata.isEmpty()) {
                 throw new IllegalStateException(
                         "Registry cache missing ASN " + asn + ". Re-run with --refresh-registry-db.");
-            } else {
-                try {
-                    final var response = classifier.classifyWithUsage(metadata.get());
-                    tokenApprox += response.approximatePromptTokens();
-                    output = response.classification();
-                } catch (InterruptedException ex) {
-                    Thread.currentThread().interrupt();
-                    throw new IOException("Interrupted while classifying AS" + asn, ex);
-                } catch (Exception ex) {
-                    System.err.printf("Classification failed for AS%d: %s%n", asn, ex.getMessage());
-                    throw ex;
+            }
+            // Fallback to live RDAP if cached metadata is incomplete
+            if (isIncomplete(metadata.get()) && rdapClient != null) {
+                final var live = rdapClient.lookup(asn);
+                if (live.isPresent() && !isIncomplete(live.get())) {
+                    System.err.printf("AS%d: Using live RDAP data (cached data incomplete)%n", asn);
+                    metadata = live;
                 }
+            }
+            FinalClassification output;
+            try {
+                final var response = classifier.classifyWithUsage(metadata.get());
+                tokenApprox += response.approximatePromptTokens();
+                output = response.classification();
+            } catch (InterruptedException ex) {
+                Thread.currentThread().interrupt();
+                throw new IOException("Interrupted while classifying AS" + asn, ex);
+            } catch (Exception ex) {
+                System.err.printf("Classification failed for AS%d: %s%n", asn, ex.getMessage());
+                throw ex;
             }
             if (shouldSkipUnknowns(output, acceptUnknowns)) {
                 System.err.printf("Skipping write for AS%d due to Unknown fields%n", asn);
@@ -164,6 +176,11 @@ public final class AsnClassifierApp {
                 System.out.printf("Progress: %.2f%% (%d/%d) | ~%d total tokens sent%n", percent, processedCount, totalToProcess, tokenApprox);
             }
         }
+    }
+
+    private static boolean isIncomplete(AsnMetadata metadata) {
+        return metadata.entityForClassification().isEmpty()
+                || (metadata.name() == null || metadata.name().isBlank());
     }
 
     private static long countPending(java.util.List<AsnAllocation> allocations, Set<Long> processed, long limit,
@@ -275,8 +292,7 @@ public final class AsnClassifierApp {
                 if (classification == null) continue;
                 final var asn = classification.asn();
                 if (asn <= 0) continue;
-                if (!acceptUnknowns && (isUnknown(classification.name()) || isUnknown(classification.organization())
-                        || isUnknown(classification.category()))) {
+                if (!acceptUnknowns && isUnknown(classification.category())) {
                     unknownSet.add(asn);
                 } else {
                     processed.add(asn);
@@ -415,6 +431,27 @@ public final class AsnClassifierApp {
         Files.move(tempFile, outputFile, java.nio.file.StandardCopyOption.REPLACE_EXISTING);
     }
 
+    private static void sortOutputByAsn(Path outputFile, ObjectMapper mapper) throws IOException {
+        if (!Files.exists(outputFile)) return;
+        final var classifications = new ArrayList<FinalClassification>();
+        try (var reader = Files.newBufferedReader(outputFile, StandardCharsets.UTF_8)) {
+            String line;
+            while ((line = reader.readLine()) != null) {
+                final var classification = parseClassification(line, mapper);
+                if (classification != null) classifications.add(classification);
+            }
+        }
+        classifications.sort(Comparator.comparingLong(FinalClassification::asn));
+        try (var writer = Files.newBufferedWriter(outputFile, StandardCharsets.UTF_8, TRUNCATE_EXISTING)) {
+            writer.write(HEADER);
+            writer.newLine();
+            for (final var classification : classifications) {
+                writer.write(toSeparatedLine(classification));
+                writer.newLine();
+            }
+        }
+    }
+
     private record ProcessedLoad(Set<Long> processed,
                                  java.util.Set<Long> unknowns,
                                  List<Long> unknownSamples) {
@@ -489,25 +526,32 @@ public final class AsnClassifierApp {
     }
 
     private static void reprocessSpecificAsns(List<Long> asns, RegistryDatabase registryDatabase,
-                                              OpenAiClassifier classifier, java.io.BufferedWriter writer,
-                                              boolean acceptUnknowns) throws IOException {
+                                              RdapClient rdapClient, OpenAiClassifier classifier,
+                                              java.io.BufferedWriter writer, boolean acceptUnknowns) throws IOException {
         for (final var asn : asns) {
-            final var metadata = registryDatabase.lookup(asn);
-            FinalClassification output;
+            var metadata = registryDatabase.lookup(asn);
             if (metadata.isEmpty()) {
                 throw new IllegalStateException(
                         "Registry cache missing ASN " + asn + ". Re-run with --refresh-registry-db.");
-            } else {
-                try {
-                    final var response = classifier.classifyWithUsage(metadata.get());
-                    output = response.classification();
-                } catch (InterruptedException ex) {
-                    Thread.currentThread().interrupt();
-                    throw new IOException("Interrupted while classifying AS" + asn, ex);
-                } catch (Exception ex) {
-                    System.err.printf("Classification failed for AS%d: %s%n", asn, ex.getMessage());
-                    throw ex;
+            }
+            // Fallback to live RDAP if cached metadata is incomplete
+            if (isIncomplete(metadata.get()) && rdapClient != null) {
+                final var live = rdapClient.lookup(asn);
+                if (live.isPresent() && !isIncomplete(live.get())) {
+                    System.err.printf("AS%d: Using live RDAP data (cached data incomplete)%n", asn);
+                    metadata = live;
                 }
+            }
+            FinalClassification output;
+            try {
+                final var response = classifier.classifyWithUsage(metadata.get());
+                output = response.classification();
+            } catch (InterruptedException ex) {
+                Thread.currentThread().interrupt();
+                throw new IOException("Interrupted while classifying AS" + asn, ex);
+            } catch (Exception ex) {
+                System.err.printf("Classification failed for AS%d: %s%n", asn, ex.getMessage());
+                throw ex;
             }
             if (shouldSkipUnknowns(output, acceptUnknowns)) {
                 System.err.printf("Skipping write for AS%d due to Unknown fields%n", asn);
@@ -520,7 +564,8 @@ public final class AsnClassifierApp {
 
     static boolean shouldSkipUnknowns(FinalClassification output, boolean acceptUnknowns) {
         if (acceptUnknowns) return false;
-        return isUnknown(output.name()) || isUnknown(output.organization()) || isUnknown(output.category());
+        // Only skip if category is Unknown - name/org can be Unknown for reserved ASNs
+        return isUnknown(output.category());
     }
 
     private static Path createRunLogDir(StatePaths state) {

@@ -4,7 +4,7 @@ plugins {
 }
 
 group = 'org.asgard'
-version = '0.2.0'
+version = '0.4.0'
 
 java {
     toolchain {
@@ -22,6 +22,7 @@ dependencies {
     implementation 'com.fasterxml.jackson.core:jackson-core:2.17.2'
     implementation 'com.fasterxml.jackson.datatype:jackson-datatype-jsr310:2.17.2'
     implementation 'org.slf4j:slf4j-simple:2.0.16'
+    implementation 'com.knuddels:jtokkit:1.1.0'
 
     testImplementation 'org.junit.jupiter:junit-jupiter:5.11.0'
     testImplementation 'org.assertj:assertj-core:3.26.3'
