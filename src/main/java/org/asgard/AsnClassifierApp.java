@@ -169,6 +169,7 @@ public final class AsnClassifierApp {
             }
             writer.write(toSeparatedLine(output));
             writer.newLine();
+            writer.flush();
             processed.add(asn);
             processedCount++;
             if (processedCount % summaryEvery == 0 || processedCount == totalToProcess) {
@@ -559,6 +560,7 @@ public final class AsnClassifierApp {
             }
             writer.write(toSeparatedLine(output));
             writer.newLine();
+            writer.flush();
         }
     }
 

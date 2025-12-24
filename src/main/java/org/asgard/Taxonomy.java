@@ -23,6 +23,8 @@ public final class Taxonomy {
                 -Hosting: Datacenters,cloud providers,VPS/bare-metal/colo/CDN
                 -ISP: Residential ISPs,mobile carriers,cable/fiber operators,last-mile providers
                 -Enterprise: Internal networks for corporations,government,military,universities,research,education
-                -Infrastructure: Large carriers,Tier-1s,IXPs,route-servers""";
+                -Infrastructure: Large carriers,Tier-1s,IXPs,route-servers
+
+                Provide your reasoning, then on the final line write ANSWER: followed by the category name.""";
     }
 }

@@ -17,7 +17,7 @@ import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 
 public final class OpenAiClassifier {
-    public static final int COMPLETION_TOKENS = 256;
+    public static final int COMPLETION_TOKENS = 512;
     private static final EncodingRegistry ENCODING_REGISTRY = Encodings.newDefaultEncodingRegistry();
     private static final Encoding TOKENIZER = ENCODING_REGISTRY.getEncoding(EncodingType.CL100K_BASE);
 
@@ -65,17 +65,11 @@ public final class OpenAiClassifier {
 
     private static final int MAX_RETRIES = 5;
     private static final long DEFAULT_RETRY_DELAY_MS = 5000;
-    private static final int EXTENDED_COMPLETION_TOKENS = 512;
 
     public ClassificationResponse classifyWithUsage(AsnMetadata metadata) throws IOException, InterruptedException {
-        return classifyWithUsage(metadata, COMPLETION_TOKENS, false);
-    }
-
-    private ClassificationResponse classifyWithUsage(AsnMetadata metadata, int maxTokens, boolean isRetryWithMoreTokens)
-            throws IOException, InterruptedException {
         if (apiKey == null || apiKey.isBlank()) throw new IllegalStateException("OpenAI API key is missing");
         var summary = metadataSummary(metadata);
-        var requestBody = buildRequest(summary, maxTokens);
+        var requestBody = buildRequest(summary);
         var approxTokens = (long) TOKENIZER.countTokens(requestBody);
 
         // Truncate if single request exceeds TPM or context limit
@@ -88,7 +82,7 @@ public final class OpenAiClassifier {
                 while (approxTokens > maxTokensAllowed && targetChars > 100) {
                     targetChars = (int) (targetChars * 0.7); // Reduce by 30% each iteration
                     summary = truncateSummary(summary, targetChars);
-                    requestBody = buildRequest(summary, maxTokens);
+                    requestBody = buildRequest(summary);
                     approxTokens = TOKENIZER.countTokens(requestBody);
                 }
                 System.err.printf("AS%d: Truncated request from %d to %d tokens (limit: %d)%n",
@@ -152,18 +146,7 @@ public final class OpenAiClassifier {
             throw new IOException("OpenAI classification failed: " + response.statusCode() + " " + responseBody);
         }
 
-        // Check for truncation and retry with more tokens if needed
-        final var parseResult = tryParseResponse(metadata, responseBody);
-        if (parseResult.truncatedWithNoCategory && !isRetryWithMoreTokens) {
-            System.err.printf("AS%d: Response truncated with no category found, retrying with %d tokens%n",
-                    metadata.asn(), EXTENDED_COMPLETION_TOKENS);
-            return classifyWithUsage(metadata, EXTENDED_COMPLETION_TOKENS, true);
-        }
-        if (parseResult.classification == null) {
-            throw new IOException(parseResult.error);
-        }
-
-        final var classification = parseResult.classification;
+        final var classification = parseResponse(metadata, responseBody);
         if (verbose) {
             System.out.printf("\n=== Parsed Classification for AS%d ===%n", metadata.asn());
             System.out.printf("Name: %s%nOrganization: %s%nCategory: %s%n",
@@ -236,10 +219,10 @@ public final class OpenAiClassifier {
         return classifyWithUsage(metadata).classification();
     }
 
-    private String buildRequest(String summary, int maxTokens) throws IOException {
+    private String buildRequest(String summary) throws IOException {
         final var root = objectMapper.createObjectNode();
         root.put("model", model);
-        root.put("max_completion_tokens", maxTokens);
+        root.put("max_completion_tokens", COMPLETION_TOKENS);
         root.put("reasoning_effort", "minimal");
         final ArrayNode messages = root.putArray("messages");
         messages.add(message("system", Taxonomy.prompt()));
@@ -287,86 +270,49 @@ public final class OpenAiClassifier {
         return node;
     }
 
-    private record ParseResult(FinalClassification classification, boolean truncatedWithNoCategory, String error) {
-        static ParseResult success(FinalClassification classification) {
-            return new ParseResult(classification, false, null);
+    private FinalClassification parseResponse(AsnMetadata metadata, String body) throws IOException {
+        final var root = objectMapper.readTree(body);
+        final var content = root.path("choices").path(0).path("message").path("content").asText();
+        if (content == null || content.isBlank()) {
+            throw new IOException("Empty OpenAI response");
         }
-        static ParseResult truncatedNoCategory(String error) {
-            return new ParseResult(null, true, error);
-        }
-        static ParseResult failure(String error) {
-            return new ParseResult(null, false, error);
-        }
-    }
-
-    private ParseResult tryParseResponse(AsnMetadata metadata, String body) {
-        try {
-            final var root = objectMapper.readTree(body);
-            final var firstChoice = root.path("choices").path(0);
-            final var finishReason = firstChoice.path("finish_reason").asText();
-            final var content = firstChoice.path("message").path("content").asText();
-            final var truncated = "length".equals(finishReason);
-
-            if (content == null || content.isBlank()) {
-                if (truncated) {
-                    return ParseResult.truncatedNoCategory("Empty OpenAI response (finish_reason: length)");
-                }
-                return ParseResult.failure("Empty OpenAI response (finish_reason: " + finishReason + ")");
-            }
-
-            final var category = normalizeCategory(content);
-            if (truncated && "Unknown".equals(category)) {
-                return ParseResult.truncatedNoCategory("OpenAI response truncated and no category found in: " +
-                        content.substring(0, Math.min(100, content.length())) + "...");
-            }
-
-            final var name = metadata.name() != null && !metadata.name().isBlank()
-                    ? metadata.name() : "Unknown";
-            final var organization = metadata.entityForClassification().orElse("Unknown");
-            return ParseResult.success(new FinalClassification(metadata.asn(), name, organization, category));
-        } catch (Exception e) {
-            return ParseResult.failure("Failed to parse OpenAI response: " + e.getMessage());
-        }
+        final var category = normalizeCategory(content);
+        final var name = metadata.name() != null && !metadata.name().isBlank() ? metadata.name() : "Unknown";
+        final var organization = metadata.entityForClassification().orElse("Unknown");
+        return new FinalClassification(metadata.asn(), name, organization, category);
     }
 
     private String normalizeCategory(String content) {
         final var trimmed = content == null ? "" : content.trim();
-        if (Taxonomy.categories().contains(trimmed)) return trimmed;
-        // try to parse json with category field if model returns structured output
-        try {
-            final var node = objectMapper.readTree(trimmed);
-            final var extracted = node.path("category").asText();
-            if (Taxonomy.categories().contains(extracted)) return extracted;
-        } catch (Exception ignored) {
+        // Check if response is just the category name
+        for (final var cat : Taxonomy.categories()) {
+            if (cat.equalsIgnoreCase(trimmed)) return cat;
         }
-        // Extract category from patterns like "Category: X", "Best fit category: X", "Final category: X"
-        final var categoryPattern = java.util.regex.Pattern.compile(
-                "(?:^|\\n)[^\\n]*?(?:Category|Classification):\\s*(\\w+)",
-                java.util.regex.Pattern.CASE_INSENSITIVE);
-        final var matcher = categoryPattern.matcher(trimmed);
-        String lastMatch = null;
-        while (matcher.find()) {
+        // Look for "ANSWER: CategoryName" pattern
+        final var answerPattern = java.util.regex.Pattern.compile(
+                "ANSWER:\\s*(\\w+)", java.util.regex.Pattern.CASE_INSENSITIVE);
+        final var matcher = answerPattern.matcher(trimmed);
+        if (matcher.find()) {
             final var extracted = matcher.group(1);
             for (final var cat : Taxonomy.categories()) {
-                if (cat.equalsIgnoreCase(extracted)) lastMatch = cat;
+                if (cat.equalsIgnoreCase(extracted)) return cat;
             }
         }
-        if (lastMatch != null) return lastMatch; // Return the last match (usually the final answer)
-        // Match "- CategoryName:" pattern (model lists category with its definition)
+        // Fallback: find category with the last occurrence in the text
+        String lastMatch = null;
+        int lastPosition = -1;
         for (final var cat : Taxonomy.categories()) {
-            final var catPattern = java.util.regex.Pattern.compile(
-                    "(?:^|\\n)\\s*-\\s*" + cat + "\\s*:",
-                    java.util.regex.Pattern.CASE_INSENSITIVE);
-            if (catPattern.matcher(trimmed).find()) return cat;
-        }
-        // Fallback: find first category mentioned as a complete word in the first 100 chars
-        final var prefix = trimmed.length() > 100 ? trimmed.substring(0, 100) : trimmed;
-        for (final var cat : Taxonomy.categories()) {
-            final var wordBoundary = java.util.regex.Pattern.compile(
+            final var wordPattern = java.util.regex.Pattern.compile(
                     "\\b" + cat + "\\b", java.util.regex.Pattern.CASE_INSENSITIVE);
-            if (wordBoundary.matcher(prefix).find()) return cat;
+            final var wordMatcher = wordPattern.matcher(trimmed);
+            while (wordMatcher.find()) {
+                if (wordMatcher.start() > lastPosition) {
+                    lastPosition = wordMatcher.start();
+                    lastMatch = cat;
+                }
+            }
         }
-        return "Unknown";
+        return lastMatch != null ? lastMatch : "Unknown";
     }
 
     private void append(StringBuilder builder, String label, String value, java.util.Set<String> seen) {
